@@ -1,13 +1,19 @@
+from copy import deepcopy
 import gc
 import time
 import numpy as np
+import pickle as pkl
+
 import torch
+import torch.optim as optim
+
 
 from tqdm import tqdm
 from npi.dataset.npi_dataset import NPIDataLoader
 
-from npi.training.config import NPIConfig
-from npi.training.train_npi import load_models
+from npi.config import NPIConfig
+from npi.models.training_models import NPITrainingModels
+from npi.training.train_npi import NPILoss, load_models
 
 # first helper fcns
 
@@ -27,6 +33,7 @@ def my_accuracy(x, y):
         return 0.0
 
 
+# TODO: Make generator optional
 class NPITrainer:
     def __init__(
         self,
@@ -34,6 +41,7 @@ class NPITrainer:
         save_freq=10,
         test_freq=5,
         batch_size=5,
+        headstart=5,
         loss_boosting_coeff=10000.0,
         discrim_coeff=3.0,
         style_coeff=10.0,
@@ -46,6 +54,7 @@ class NPITrainer:
         self.save_freq = save_freq
         self.test_freq = test_freq
         self.batch_size = batch_size
+        self.headstart = headstart
         self.loss_boosting_coeff = loss_boosting_coeff
         self.discrim_coeff = discrim_coeff
         self.style_coeff = style_coeff
@@ -53,31 +62,34 @@ class NPITrainer:
         self.npi_lr = npi_lr
         self.disc_lr = disc_lr
 
-        # Initialize model
-        self.npi_model = load_models()
-        self.content_class_model = None
-        self.generate_class_model = None
-        self.gpt2_with_npi = None
-        self.gpt2_tokenizer = None
-
         # Initialize loss functions
-        self.npi_objective = None
-        self.generate_class_objective = None
-        self.bce_loss = None
-        self.mse_loss = None
+        self.npi_objective = NPILoss(discrim_coeff, style_coeff, similarity_coeff)
+        self.generate_class_objective = torch.nn.BCELoss()
+        self.bce_loss = torch.nn.BCELoss()
+        self.mse_loss = torch.nn.MSELoss()
+        self.list_average = lambda x: sum(x) / float(len(x))
 
-        # Initialize optimizer
-        self.npi_optimizer = None
-        self.generate_class_optimizer = None
+        # Initialize data structures to store training results
+        self.train_metadata = {
+            "npi_losses": [],
+            "generate_class_losses": [],
+            "generate_class_accuracies": [],
+        }
+        self.train_batch_metadata = deepcopy(self.train_metadata)
 
-        # Initialize Data to train
-        # TODO: remove data initialization from this script. Set when starting training.
-        self.train_loader = None
-        self.functional_batch_size = None
+        self.test_metadata = {
+            "npi_test_losses": [],
+            "content_class_test_losses": [],
+            "generate_class_tests_losses": [],
+            "generate_false_class_test_losses": [],
+            "content_class_test_accuracies": [],
+            "generate_class_test_accuracies": [],
+            "generate_class_false_test_accuracies": [],
+        }
+        self.test_batch_metadata = deepcopy(self.test_metadata)
 
-        # Initialize data structure to store training results
-        self.npi_batch_losses = []
-        self.generate_class_batch_losses = []
+        # Seed torch
+        torch.manual_seed(1)
 
     def train_generator_step(self, orig_activ, pred_gpt2_outs):
         self.generate_class_model.train()
@@ -190,16 +202,6 @@ class NPITrainer:
     def test_npi(self, batch_size, test_loader, gpt2_with_npi):
         # print("Testing: START")
         # perform npi_model testing
-        npi_test_batch_losses = []
-        content_class_test_losses = []
-        content_false_class_test_losses = []
-        generation_class_test_losses = []
-        generation_false_class_test_losses = []
-
-        content_class_test_batch_accuracies = []
-        generate_class_test_batch_accuracies = []
-        content_class_false_test_batch_accuracies = []
-        generate_class_false_test_batch_accuracies = []
 
         for test_batch, (test_x, test_t, test_y, test_inds) in enumerate(test_loader):
 
@@ -239,11 +241,14 @@ class NPITrainer:
             test_g_class_loss = self.loss_boosting_coeff * (
                 test_real_gen_loss + test_fake_gen_loss
             )
+
             # append losses and get accuracy
-            generation_class_test_losses.append(
+            self.test_batch_metadata["generate_class_tests_losses"].append(
                 test_g_class_loss.item()
             )  # note this is the sum of real and fake loss
-            generation_false_class_test_losses.append(test_fake_gen_loss.item())
+            self.test_batch_metadata["generate_false_class_test_losses"].append(
+                test_fake_gen_loss.item()
+            )
             test_real_gen_acc = my_accuracy(
                 test_real_gen_pred.squeeze(), y_real_GPT2.squeeze()
             )
@@ -251,8 +256,12 @@ class NPITrainer:
                 test_fake_gen_pred.squeeze(), y_fake_GPT2.squeeze()
             )
             test_avg_gen_acc = (test_real_gen_acc + test_fake_gen_acc) / 2.0
-            generate_class_test_batch_accuracies.append(test_avg_gen_acc)
-            generate_class_false_test_batch_accuracies.append(test_fake_gen_acc)
+            self.test_batch_metadata["generate_class_test_accuracies"].append(
+                test_avg_gen_acc
+            )
+            self.test_batch_metadata["generate_class_false_test_accuracies"].append(
+                test_fake_gen_acc
+            )
 
             self.npi_model.eval()
             test_content_classification = self.content_class_model(test_gpt2_outs)
@@ -270,91 +279,14 @@ class NPITrainer:
                 + self.similarity_coeff * test_similarity_loss
             )
             # append losses and get accuracy
-            npi_test_batch_losses.append(test_npi_loss.item())
+            self.test_batch_metadata["npi_test_losses"].append(test_npi_loss.item())
             # Don't forget the accuracy number from the classifier
             acc_from_content_class = my_accuracy(
                 test_content_classification.squeeze(), y_word.squeeze()
             )
-            content_class_false_test_batch_accuracies.append(acc_from_content_class)
-
-            if file_num == len(train_file_names) - 1 and test_batch == 0:
-                class_sample_meta_data["testing data"]["epoch {}".format(epoch)] = {
-                    "real array classifications": test_real_gen_pred.squeeze()
-                    .data.cpu()
-                    .numpy(),
-                    "NPI-produced array classifications": test_fake_gen_pred.squeeze()
-                    .data.cpu()
-                    .numpy(),
-                    "testing loss": test_g_class_loss.cpu().item(),
-                    "testing accuracy": test_avg_gen_acc,
-                }
-                npi_sample_meta_data["testing data"]["epoch {}".format(epoch)] = {
-                    "style loss": test_style_loss.cpu().item(),
-                    "similarity loss": test_similarity_loss.cpu().item(),
-                    "discrim loss": test_discrim_loss.cpu().item(),
-                    "content classifier classifications": test_content_classification.squeeze()
-                    .data.cpu()
-                    .numpy(),
-                    "text samples": test_text,
-                }
-
-        # Testing: STOP
-
-    def save_models(self):
-        print("Saving NPI Model")
-        out_path = save_file_path + "{}_npi_network_epoch{}.bin".format(npi_type, epoch)
-        torch.save(npi_model.state_dict(), out_path)
-
-        print("Saving NPI Loss Summary")
-        out_path = save_file_path + "{}_npi_loss_summaries_epoch{}.pkl".format(
-            npi_type, epoch
-        )
-        with open(out_path, "wb") as outfile:
-            pkl.dump(
-                {
-                    "epoch_losses": npi_epoch_losses,
-                    "test_losses": npi_test_losses,
-                    "accuracies_from_content_class": content_class_false_test_accuracies,
-                    "sample_meta_data": npi_sample_meta_data,
-                },
-                outfile,
+            self.test_batch_metadata["content_class_test_accuracies"].append(
+                acc_from_content_class
             )
-
-        # print("Saving ContentClassifier Loss Summary")
-        # out_path = save_file_path + "{}_loss_summaries_epoch{}.pkl".format("ContentClassifier", epoch)
-        # with open(out_path, 'wb') as outfile:
-        #    pkl.dump({"false_test_losses": content_false_class_tests,
-        #                "avg_test_losses": content_class_tests,
-        #                "false_test_accuracies": content_class_false_test_accuracies,
-        #                "avg_test_accuracies": content_class_test_accuracies,
-        #             }, outfile)
-
-        print("Saving GenerationClassifier Model")
-        out_path = save_file_path + "{}_network_epoch{}.bin".format(
-            "GenerationClassifier", epoch
-        )
-        torch.save(generate_class_model.state_dict(), out_path)
-
-        print("Saving GenerationClassifier Loss Summary")
-        out_path = None
-        out_path = save_file_path + "{}_loss_summaries_epoch{}.pkl".format(
-            "GenerationClassifier", epoch
-        )
-        with open(out_path, "wb") as outfile:
-            pkl.dump(
-                {
-                    "epoch_losses": generate_class_epoch_losses,
-                    "false_tests": generate_false_class_tests,
-                    "avg_tests": generate_class_tests,
-                    "training_accuracies": generate_class_train_accuracies,
-                    "false_test_accuracies": generate_class_false_test_accuracies,
-                    "avg_test_accuracies": generate_class_test_accuracies,
-                    "sample_meta_data": class_sample_meta_data,
-                },
-                outfile,
-            )
-
-        print("Done saving for current epoch")
 
     def visualize_training(self):
         print("Saving Data Visualizations: START")
@@ -459,7 +391,34 @@ class NPITrainer:
 
         print("Saving Data Visualizations: STOP")
 
-    def train_adversarial_npi(self, num_epochs, train_loader, test_loader):
+    def train_adversarial_npi(
+        self, npi_training_models: NPITrainingModels, num_epochs, train_data, test_data
+    ):
+        # Initialize model
+        (
+            self.npi_model,
+            self.generate_class_model,
+            self.content_class_model,
+        ) = npi_training_models.load_training_models()
+
+        self.gpt2_with_npi, self.gpt2_tokenizer = npi_training_models.load_gpt2()
+
+        # Initialize Data to train
+        self.train_loader = NPIDataLoader(
+            train_data, batch_size=self.batch_size, pin_memory=True
+        )
+        self.test_loader = NPIDataLoader(
+            test_data, batch_size=self.batch_size, pin_memory=True
+        )
+
+        # Initialize optimizer
+        self.npi_optimizer = optim.Adam(self.npi_model.parameters(), lr=self.npi_lr)
+        self.generate_class_optimizer = optim.Adam(
+            self.generate_class_model.parameters(), lr=self.disc_lr
+        )
+        self.npi_objective.content_classifier_model = self.content_class_model
+        self.npi_objective.generation_classifier_model = self.generate_class_model
+
         print("Training")
 
         for epoch in range(num_epochs):
@@ -471,19 +430,22 @@ class NPITrainer:
             generate_class_train_batch_accuracies = []
 
             # Looping through training batches
-            loop = tqdm(total=len(train_loader), position=0, leave=False)
+            loop = tqdm(total=len(self.train_loader), position=0, leave=False)
             for batch, (orig_activ, real_label, target_label, data_idx) in enumerate(
-                train_loader
+                self.train_loader
             ):
+                self.functional_batch_size = orig_activ.shape[0]
+                print(
+                    f"Debug: See if batch size needs to be set. configured batch size:{self.batch_size}. functional batch size:{self.functional_batch_size}"
+                )
 
                 if epoch >= self.headstart:
                     g_class_loss_item = self.train_generator_step(orig_activ)
 
                 npi_loss = self.train_npi_step(orig_activ, data_idx)
 
-                if (
-                    g_class_loss_item is not None
-                ):  # will be None if we are still in the headstart
+                # will be None if we are still in the headstart
+                if g_class_loss_item is not None:
                     loop.set_description(
                         f"epoch:{epoch}, gen_class_loss:{g_class_loss_item:.2f}, npi_loss:{npi_loss:.2f}"
                     )
@@ -491,191 +453,41 @@ class NPITrainer:
                     loop.set_description(
                         f"epoch:{epoch}, gen_class_loss:N/A, npi_loss:{npi_loss.item():.2f}"
                     )
-
-                # save meta data
-                if (
-                    (epoch % save_freq == 0)
-                    and file_num == len(train_file_names) - 1
-                    and batch == 0
-                    and epoch >= HEAD_START_NUM
-                ):
-                    class_sample_meta_data["training data"][
-                        "epoch {}".format(epoch)
-                    ] = {
-                        "real array classifications": real_gen_pred.squeeze()
-                        .data.cpu()
-                        .numpy(),
-                        "NPI-produced array classifications": fake_gen_pred.squeeze()
-                        .data.cpu()
-                        .numpy(),
-                        "training loss": g_class_loss.cpu().item(),
-                    }
-                    npi_sample_meta_data["training data"]["epoch {}".format(epoch)] = {
-                        "style loss": style_loss.cpu().item(),
-                        "similarity loss": similarity_loss.cpu().item(),
-                        "discrim loss": discrim_loss.cpu().item(),
-                        "content classifier classifications": content_classification.squeeze()
-                        .data.cpu()
-                        .numpy(),
-                        "test_samples": training_text,
-                    }
-
                     # This marks the end of looping through the training batches! :D
 
             # collect more averages for meta data
-            if npi_batch_losses:
-                npi_epoch_losses.append(
-                    (sum(npi_batch_losses) / float(len(npi_batch_losses)))
-                )
-
-            if generate_class_batch_losses:
-                generate_class_epoch_losses.append(
-                    (
-                        sum(generate_class_batch_losses)
-                        / float(len(generate_class_batch_losses))
+            for key, value in self.train_metadata.items():
+                if self.train_batch_metadata[key]:
+                    value.append(
+                        (epoch, self.list_average(self.train_batch_metadata[key]))
                     )
-                )
-
-            if (
-                epoch % test_freq == 0
-                and generate_class_train_batch_accuracies
-                and epoch >= HEAD_START_NUM
-            ):
-                generate_class_train_accuracies.append(
-                    (
-                        epoch,
-                        (
-                            sum(generate_class_train_batch_accuracies)
-                            / float(len(generate_class_train_batch_accuracies))
-                        ),
-                    )
-                )
 
             # TESTING
 
             # and epoch >= 1: # AFTER TRAINING PERFORM ANY REQUIRED TESTS
-            if epoch % test_freq == 0 and epoch >= HEAD_START_NUM:
+            if epoch % self.test_freq == 0 and epoch >= self.headstart:
                 self.test_npi()
-                # Testing: Storing loss avgs
-                if npi_test_batch_losses:
-                    npi_test_losses.append(
-                        (
-                            epoch,
-                            (
-                                sum(npi_test_batch_losses)
-                                / float(len(npi_test_batch_losses))
-                            ),
+                for key, value in self.test_metadata.items():
+                    # Testing: Storing loss avgs
+                    if self.test_batch_metadata[key]:
+                        value.append(
+                            (epoch, self.list_average(self.test_batch_metadata[key]))
                         )
-                    )
-                if content_class_test_losses:
-                    content_class_tests.append(
-                        (
-                            epoch,
-                            (
-                                sum(content_class_test_losses)
-                                / float(len(content_class_test_losses))
-                            ),
-                        )
-                    )
-                if content_false_class_test_losses:
-                    content_false_class_tests.append(
-                        (
-                            epoch,
-                            (
-                                sum(content_false_class_test_losses)
-                                / float(len(content_false_class_test_losses))
-                            ),
-                        )
-                    )
-                if generation_class_test_losses:
-                    generate_class_tests.append(
-                        (
-                            epoch,
-                            (
-                                sum(generation_class_test_losses)
-                                / float(len(generation_class_test_losses))
-                            ),
-                        )
-                    )
-                if generation_false_class_test_losses:
-                    generate_false_class_tests.append(
-                        (
-                            epoch,
-                            (
-                                sum(generation_false_class_test_losses)
-                                / float(len(generation_false_class_test_losses))
-                            ),
-                        )
-                    )
-
-                # Testing: Storing accuracy avgs
-                if content_class_test_batch_accuracies:
-                    content_class_test_accuracies.append(
-                        (
-                            epoch,
-                            (
-                                sum(content_class_test_batch_accuracies)
-                                / float(len(content_class_test_batch_accuracies))
-                            ),
-                        )
-                    )
-                if generate_class_test_batch_accuracies:
-                    generate_class_test_accuracies.append(
-                        (
-                            epoch,
-                            (
-                                sum(generate_class_test_batch_accuracies)
-                                / float(len(generate_class_test_batch_accuracies))
-                            ),
-                        )
-                    )
-                if content_class_false_test_batch_accuracies:
-                    content_class_false_test_accuracies.append(
-                        (
-                            epoch,
-                            (
-                                sum(content_class_false_test_batch_accuracies)
-                                / float(len(content_class_false_test_batch_accuracies))
-                            ),
-                        )
-                    )
-                if generate_class_false_test_batch_accuracies:
-                    generate_class_false_test_accuracies.append(
-                        (
-                            epoch,
-                            (
-                                sum(generate_class_false_test_batch_accuracies)
-                                / float(len(generate_class_false_test_batch_accuracies))
-                            ),
-                        )
-                    )
+                out_path = f"{self.config.save_folder}{self.config.npi_type}_npi_train_summaries_epoch{epoch}.pkl"
+                with open(out_path, "wb") as outfile:
+                    pkl.dump(self.train_metadata, outfile)
+                out_path = f"{self.config.save_folder}npi_test_summaries_epoch{epoch}.pkl"
+                with open(out_path, "wb") as outfile:
+                    pkl.dump(self.test_metadata, outfile)
 
             # report current state to terminal
             torch.cuda.empty_cache()
-            if g_class_loss_item is not None:
-                loop.set_description(
-                    "epoch:{}, gen_class_loss:{:.2f}, npi_loss:{:.2f}, time_elapsed:{:.1f}".format(
-                        epoch,
-                        g_class_loss_item,
-                        npi_loss.item(),
-                        (time.time() - start_time),
-                    )
-                )
-            else:
-                loop.set_description(
-                    "epoch:{}, gen_class_loss:N/A, npi_loss:{:.2f}, time_elapsed:{:.1f}".format(
-                        epoch, npi_loss.item(), (time.time() - start_time)
-                    )
-                )
             loop.update(1)
 
         print("end of regular epoch")
 
         if epoch % self.save_freq == 0 and epoch >= self.headstart:
-            # save the current version of the npi_model
             self.save_models()
-
-            # ~~~~~~NOW for the visualizations~~~~~~~~~~~~~~~~~~~~~~~~~~
             self.visualize_training()
         torch.cuda.empty_cache()
         loop.close()

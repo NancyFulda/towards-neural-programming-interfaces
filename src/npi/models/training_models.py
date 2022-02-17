@@ -17,14 +17,16 @@ class NPITrainingModels:
         self.npi_model_path = npi_model_path
         self.content_classifier_path = content_classifier_path
         self.generation_classifier_path = generation_classifier_path
-        self.input_activs_shape = None
-        self.input_targ_shape = None
+        self.input_activs_shape = None  # TODO: Get hyperparam from config
+        self.input_targ_shape = None  # TODO: Get hyperparam from config
+
+        self.npi_model = None
+        self.content_class_model = None
+        self.generate_class_model = None
 
     def load_npi_model(self, reload=False):
         if reload or not self.npi_model:
-            self.npi_model = NPINetwork(
-                self.input_activs_shape, self.input_targ_shape
-            ).float()
+            self.npi_model = NPINetwork(self.input_activs_shape).float()
             if self.npi_model_path is not None:
                 self.npi_model.load_state_dict(
                     torch.load(self.npi_model_path, map_location="cpu")
@@ -49,7 +51,7 @@ class NPITrainingModels:
         return self.generate_class_model
 
     def load_content_classifier(self, reload=False):
-        if reload or not self.generate_class_model:
+        if reload or not self.content_class_model:
             self.content_class_model = Classifier()
             if self.content_classifier_path is not None:
                 print("LOADING PRE-TRAINED CONTENT CLASSIFIER NETWORK")
@@ -64,7 +66,7 @@ class NPITrainingModels:
                     "Classifier should be pretrained. Pass in the path to the classifer."
                 )
             self.content_class_model.cuda(device=self.config.device)
-        
+
         return self.content_class_model
 
     def load_gpt2(self):
@@ -95,6 +97,7 @@ class NPITrainingModels:
         torch.save(self.npi_model.state_dict(), out_path)
 
         print("Saving GenerationClassifier Model")
-        out_path = f"{self.config.save_folder}GenerationClassifier_network_epoch{epoch}.bin"
+        out_path = (
+            f"{self.config.save_folder}GenerationClassifier_network_epoch{epoch}.bin"
+        )
         torch.save(self.generate_class_model.state_dict(), out_path)
-

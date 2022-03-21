@@ -1,3 +1,4 @@
+import os
 import torch
 
 
@@ -33,6 +34,9 @@ class NPIConfig:
         self.dataset_folder = (
             dataset_folder if dataset_folder.endswith("/") else dataset_folder + "/"
         )
+        os.makedirs(self.model_save_folder, exist_ok = True)
+        os.makedirs(self.dataset_folder, exist_ok = True)
+        
         self.npi_name = npi_name
         self.dataset_file = self.dataset_folder + self.npi_name + ".tar"
         self.batch_size = batch_size

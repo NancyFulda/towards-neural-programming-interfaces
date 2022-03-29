@@ -19,7 +19,6 @@ Overview:
 import gc
 
 import numpy as np
-from sklearn import metrics
 import torch
 import torch.optim as optim
 from tqdm import tqdm
@@ -28,8 +27,6 @@ from npi.dataset import NPIDatasetLoader
 
 from npi.modeling_neural_program_interfaces import *
 from npi.models import NPITrainingModels
-from npi.models.classifiers import StyleClassifier  # from transformers import *
-
 
 class NPIStyleTrainer:
     def __init__(

@@ -52,7 +52,7 @@ class NPIDatasetConstructor:
         )
         try:
             for index, (line, cls) in enumerate(pbar):
-                if index == data_len:  # Break if reached amount of data to generate.
+                if index >= data_len:  # Break if reached amount of data to generate.
                     break
 
                 # clean line to some extent

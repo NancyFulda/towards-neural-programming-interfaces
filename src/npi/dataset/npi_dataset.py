@@ -54,7 +54,7 @@ class NPIDatasetLoader:
                 only=items,
             )
             .to_tuple(items)
-            .batched(1000)
+            .batched(10)
         )
 
         self.test_dataset: IterableDataset = (
@@ -65,7 +65,7 @@ class NPIDatasetLoader:
                 only=items,
             )
             .to_tuple(items)
-            .batched(1000)
+            .batched(10)
         )
 
     def load_train_and_test_dataloaders(self, batch_size=5):
@@ -82,11 +82,11 @@ class NPIDatasetLoader:
             # ),
             wds.WebLoader(self.dataset, batch_size=None)
             .unbatched()
-            .shuffle(1000)
+            # .shuffle(1000) TODO: See best way to enable shuffling
             .batched(batch_size, partial=False),
             wds.WebLoader(self.test_dataset, batch_size=None)
             .unbatched()
-            .shuffle(1000)
+            # .shuffle(1000)
             .batched(batch_size, partial=False),
             (self.split - 1) // batch_size,
             (self.total - self.split) // batch_size,

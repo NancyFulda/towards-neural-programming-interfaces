@@ -1,10 +1,6 @@
 import os
 import torch
 
-
-# TODO: Make sure save folder actually exists. Raise an error if it doesn't
-
-
 LM_CONFIG_DICT = {'gpt2': {'total_layers': 13, 'm': 768},
                 'gpt2-medium': {'total_layers': 25, 'm': 1024}}
 class NPIConfig:
@@ -36,7 +32,7 @@ class NPIConfig:
         )
         os.makedirs(self.model_save_folder, exist_ok = True)
         os.makedirs(self.dataset_folder, exist_ok = True)
-        
+
         self.npi_name = npi_name
         self.dataset_file = self.dataset_folder + self.npi_name + ".tar"
         self.batch_size = batch_size
